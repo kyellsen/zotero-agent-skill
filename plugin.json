@@ -1,0 +1,10 @@
+{
+  "name": "zotero-local",
+  "version": "1.1.0",
+  "description": "Agent skills for local Zotero library access (SQLite + REST API + Web API)",
+  "author": {
+    "name": "Kyell Jensen"
+  },
+  "repository": "https://github.com/kyellsen/zotero-agent-skill",
+  "license": "MIT"
+}
