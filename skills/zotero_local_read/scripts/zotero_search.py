@@ -14,6 +14,7 @@ Usage:
     uv run zotero_search.py search "QUERY" [--limit N] [--fulltext] [--zotero-dir PATH]
     uv run zotero_search.py get-text "KEY" [--zotero-dir PATH]
     uv run zotero_search.py get-metadata "KEY" [--zotero-dir PATH]
+    uv run zotero_search.py status [--zotero-dir PATH]
 """
 
 import argparse
@@ -571,10 +572,54 @@ def _resolve_key(identifier: str, sqlite_path: Path) -> str:
     sys.exit(1)
 
 
+def get_status(zotero_dir: Path, sqlite_path: Path) -> dict:
+    """Returns status information about the Zotero environment.
+
+    Args:
+        zotero_dir: Path to the Zotero data directory.
+        sqlite_path: Path to the zotero.sqlite file.
+
+    Returns:
+        Dict with rest_api, sqlite, zotero_dir, item_count,
+        attachment_count.
+    """
+    api_running = is_api_running()
+    sqlite_exists = sqlite_path.exists()
+
+    item_count = 0
+    attachment_count = 0
+
+    if sqlite_exists:
+        conn_str = f"file:{sqlite_path}?mode=ro&immutable=1"
+        try:
+            conn = sqlite3.connect(conn_str, uri=True)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM items WHERE itemTypeID NOT IN (?, ?)",
+                (ITEM_TYPE_ATTACHMENT, ITEM_TYPE_NOTE),
+            )
+            item_count = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT COUNT(*) FROM itemAttachments",
+            )
+            attachment_count = cursor.fetchone()[0]
+            conn.close()
+        except Exception as e:
+            print(f"SQLite status query failed: {e}", file=sys.stderr)
+
+    return {
+        "rest_api": api_running,
+        "sqlite": sqlite_exists,
+        "zotero_dir": str(zotero_dir),
+        "item_count": item_count,
+        "attachment_count": attachment_count,
+    }
+
+
 def main() -> None:
-    """CLI entry point for search, metadata, and fulltext retrieval."""
+    """CLI entry point for search, metadata, fulltext retrieval, and status."""
     parser = argparse.ArgumentParser(
-        description="Zotero local read — search, metadata, and fulltext."
+        description="Zotero local read — search, metadata, fulltext, status."
     )
     parser.add_argument(
         "--zotero-dir",
@@ -620,9 +665,20 @@ def main() -> None:
         help="Zotero key (YVHV6XLI) or citation key (wessolly2014Baumstatik)",
     )
 
+    # status command
+    subparsers.add_parser(
+        "status", help="Check Zotero availability and library stats."
+    )
+
     args = parser.parse_args()
     zotero_dir = args.zotero_dir or _default_zotero_dir()
     sqlite_path = zotero_dir / "zotero.sqlite"
+
+    if args.command == "status":
+        status = get_status(zotero_dir, sqlite_path)
+        print(json.dumps(status, indent=2, ensure_ascii=False))
+        return
+
     api_active = is_api_running()
 
     if args.command == "search":
@@ -706,3 +762,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

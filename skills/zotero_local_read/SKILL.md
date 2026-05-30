@@ -23,16 +23,38 @@ Read-only search, metadata, and fulltext retrieval from a local Zotero library.
     fallback. Not required if Zotero's fulltext cache (`.zotero-ft-cache`) is
     populated.
 
+## Structure of the Skill Folder
+
+-   `SKILL.md` — This file
+-   `scripts/zotero_search.py` — CLI tool (search, get-text, get-metadata, status)
+-   `references/api-recipes.md` — Direct curl and sqlite3 recipes for advanced queries
+
 ## Core Rules
 
 -   🚨 **READ-ONLY**: NEVER write to, modify, or delete any file in the Zotero
     storage directory or database.
 -   **SQLite safety**: NEVER open the database without `?mode=ro&immutable=1`.
--   **Prefer the CLI** (`scripts/zotero_search.py`) for standard operations
-    (search, get-text, get-metadata). For advanced queries not covered by the
-    CLI, use the direct API recipes documented below or in `references/`.
+-   **Prefer the CLI** (`scripts/zotero_search.py`) for standard operations.
+    For advanced queries not covered by the CLI, use the direct API recipes
+    in `references/api-recipes.md`.
 -   **JSON processing**: Use `jq` to filter and transform JSON output to prevent
     context overflow.
+-   **Citation output**: Always return the `citationKey` field alongside results
+    so the user can reference sources in their documents (e.g. `@citationKey`).
+-   **No fabrication**: Never invent Zotero keys or citation keys. Use `search`
+    to look them up. Report empty results accurately.
+
+## Context Management
+
+-   **Slim fulltext output**: Fulltext can be 100k+ characters. Always pipe
+    through `head -500` for preview, or use `grep -i "KEYWORD"` to extract
+    relevant passages. Never read raw fulltext into context without truncation.
+-   **Limit search results**: Use `--limit 10` for overview queries. Only
+    increase when explicitly searching for completeness.
+-   **Filter early**: Use `jq` to extract only needed fields before reading
+    JSON into context (e.g. `jq '.[] | {key, title, citationKey}'`).
+-   **Search termination**: If 3 varied search queries return no results,
+    conclude that no items match rather than continuing to iterate.
 
 ## CLI Usage
 
@@ -50,13 +72,34 @@ All commands are run from **this skill's directory**.
 uv run scripts/zotero_search.py search "QUERY" [--limit N] [--fulltext] [--zotero-dir PATH]
 ```
 
-- Default: Searches title, creator, year only.
-- `--fulltext`: Searches inside PDF/document content (requires Zotero running).
+**Arguments:**
+
+-   `QUERY` (str, required) — Search term (author name, title fragment, year).
+-   `--limit N` (int, default 15) — Maximum number of results.
+-   `--fulltext` (flag) — Search inside PDF/document content instead of
+    title/creator/year. Requires Zotero running (REST API). Falls back to
+    title/creator/year via SQLite with a warning if Zotero is not running.
+-   `--zotero-dir PATH` (Path, optional) — Override Zotero data directory.
+
+**Output:** JSON array of matching items:
+
+```json
+[
+  {
+    "key": "P3XQNZ6V",
+    "title": "Manual of tree statics and tree inspection",
+    "citationKey": "wessolly2016ManualTreeStatics",
+    "creators": "Wessolly, Erb",
+    "date": "2016",
+    "attachmentKey": "QMZB6VWH"
+  }
+]
+```
 
 **Recipes:**
 ```bash
-# Basic search
-uv run scripts/zotero_search.py search "Wessolly" | jq '.[] | {key, title}'
+# Basic search — slim output
+uv run scripts/zotero_search.py search "Wessolly" | jq '.[] | {key, title, citationKey}'
 
 # Search INSIDE document content (PDFs, HTML snapshots)
 uv run scripts/zotero_search.py search "Windlast" --fulltext --limit 20
@@ -65,14 +108,22 @@ uv run scripts/zotero_search.py search "Windlast" --fulltext --limit 20
 uv run scripts/zotero_search.py search "Kronensicherung" --limit 30
 ```
 
+---
+
 #### `get-text` — Retrieve fulltext for an item
 
 ```bash
 uv run scripts/zotero_search.py get-text "KEY_OR_CITATION_KEY" [--zotero-dir PATH]
 ```
 
-Accepts both 8-char Zotero keys (`YVHV6XLI`) and Better BibTeX citation keys
-(`wessolly2014Baumstatik`). Automatically resolves citation keys via SQLite.
+**Arguments:**
+
+-   `KEY_OR_CITATION_KEY` (str, required) — Either an 8-char Zotero key
+    (`YVHV6XLI`) or a Better BibTeX citation key (`wessolly2014Baumstatik`).
+    Citation keys are automatically resolved via SQLite.
+-   `--zotero-dir PATH` (Path, optional) — Override Zotero data directory.
+
+**Output:** Plain text on stdout. Can be very large (100k+ chars for books).
 
 **Fulltext priority chain:**
 1. REST API `/fulltext` endpoint (Zotero running, item indexed)
@@ -80,21 +131,23 @@ Accepts both 8-char Zotero keys (`YVHV6XLI`) and Better BibTeX citation keys
 3. `pdftotext` extraction from PDF (requires `poppler-utils`)
 4. HTML snapshot text extraction (for web page snapshots)
 
-If all methods fail, use the agent's `view_file` tool directly on the PDF for
-built-in OCR.
+If all methods fail, exit code 1 with diagnostic on stderr. In this case, use
+the agent's `view_file` tool directly on the PDF for built-in OCR.
 
 **Recipes:**
 ```bash
-# Get text and pipe to head for preview
-uv run scripts/zotero_search.py get-text "YVHV6XLI" | head -100
+# Preview first 500 lines (ALWAYS do this first)
+uv run scripts/zotero_search.py get-text "YVHV6XLI" | head -500
 
-# Get text for a citation key
-uv run scripts/zotero_search.py get-text "wessolly2014Baumstatik"
+# Search for specific content within a document
+uv run scripts/zotero_search.py get-text "wessolly2014Baumstatik" | grep -i "kronensicherung" -A 5
 
 # Search then get text for the first result
 KEY=$(uv run scripts/zotero_search.py search "Wessolly" | jq -r '.[0].key')
-uv run scripts/zotero_search.py get-text "$KEY" | head -50
+uv run scripts/zotero_search.py get-text "$KEY" | head -500
 ```
+
+---
 
 #### `get-metadata` — Read full item metadata (local, no API key needed)
 
@@ -102,18 +155,114 @@ uv run scripts/zotero_search.py get-text "$KEY" | head -50
 uv run scripts/zotero_search.py get-metadata "KEY_OR_CITATION_KEY" [--zotero-dir PATH]
 ```
 
-Returns complete metadata including title, creators, date, DOI, tags,
-collections, and attachment info. Uses REST API when available, SQLite fallback
-otherwise. **No Web API key required.**
+**Arguments:**
+
+-   `KEY_OR_CITATION_KEY` (str, required) — Zotero key or citation key.
+-   `--zotero-dir PATH` (Path, optional) — Override Zotero data directory.
+
+**Output:** JSON object with all metadata fields:
+
+```json
+{
+  "key": "P3XQNZ6V",
+  "itemType": "book",
+  "title": "Manual of tree statics and tree inspection",
+  "creators": [{"creatorType": "author", "firstName": "Lothar", "lastName": "Wessolly"}, ...],
+  "date": "2016",
+  "publisher": "Patzer Verlag",
+  "ISBN": "978-3-87617-143-2",
+  "citationKey": "wessolly2016ManualTreeStatics",
+  "tags": [{"tag": "citable"}, ...],
+  "attachments": [{"key": "QMZB6VWH", "contentType": "application/pdf", "path": "storage:...pdf"}]
+}
+```
 
 **Recipes:**
 ```bash
-# Get metadata for a specific item
-uv run scripts/zotero_search.py get-metadata "P3XQNZ6V" | jq '{title, date, DOI, creators}'
+# Get compact metadata
+uv run scripts/zotero_search.py get-metadata "P3XQNZ6V" | jq '{title, date, DOI, citationKey, creators: [.creators[] | "\(.firstName) \(.lastName)"]}'
 
 # Get metadata for a citation key
 uv run scripts/zotero_search.py get-metadata "wessolly2016ManualTreeStatics"
+
+# Find the PDF path for an item
+uv run scripts/zotero_search.py get-metadata "P3XQNZ6V" | jq '.attachments[] | select(.contentType == "application/pdf") | .path'
 ```
+
+---
+
+#### `status` — Check Zotero availability and library stats
+
+```bash
+uv run scripts/zotero_search.py status [--zotero-dir PATH]
+```
+
+**Arguments:**
+
+-   `--zotero-dir PATH` (Path, optional) — Override Zotero data directory.
+
+**Output:** JSON object with availability info:
+
+```json
+{
+  "rest_api": true,
+  "sqlite": true,
+  "zotero_dir": "/home/user/Zotero",
+  "item_count": 3600,
+  "attachment_count": 4200
+}
+```
+
+---
+
+## Common Workflows
+
+### Find a Source and Read It
+
+```bash
+# 1. Search for the item
+uv run scripts/zotero_search.py search "Wessolly Baumstatik" | jq '.[] | {key, title, citationKey}'
+
+# 2. Read the fulltext (preview first 500 lines)
+uv run scripts/zotero_search.py get-text "wessolly2016ManualTreeStatics" | head -500
+
+# 3. Search for specific content within the document
+uv run scripts/zotero_search.py get-text "wessolly2016ManualTreeStatics" | grep -i "kronensicherung" -A 10
+```
+
+### Look Up a Citation Key for Typst/LaTeX
+
+```bash
+# Search → extract citation key → use in document as @citationKey
+uv run scripts/zotero_search.py search "Detter Zugversuch" | jq -r '.[0].citationKey'
+# Output: detter2025AktuelleEntwicklungenZur → use as @detter2025AktuelleEntwicklungenZur
+```
+
+### Check Metadata Before Citing
+
+```bash
+# Verify metadata is correct before citing
+uv run scripts/zotero_search.py get-metadata "P3XQNZ6V" | jq '{title, date, creators, DOI, ISBN}'
+```
+
+### Find All Items by Tag
+
+```bash
+# Direct API recipe (not covered by CLI)
+curl -s "http://localhost:23119/api/users/0/items?tag=citable&format=json&limit=100" \
+  | jq '[.[].data | {key, title, citationKey, date}]'
+```
+
+## Error Handling
+
+| Situation | Behavior | Action |
+|---|---|---|
+| Zotero not running | Falls back to SQLite + filesystem | No action needed — automatic |
+| `--fulltext` without Zotero | Warning on stderr, falls back to title/creator search | Start Zotero for fulltext search |
+| Citation key not found | Exit code 1, error on stderr | Verify key with `search` first |
+| No attachment found | Exit code 1, diagnostic on stderr | Use `get-metadata` to check attachments |
+| PDF not text-indexed | `get-text` fails, suggests `view_file` | Use agent's `view_file` tool on the PDF directly |
+| SQLite DB not found | Error on stderr, empty results | Check `--zotero-dir` path |
 
 ## Advanced Recipes (Direct API Access)
 
@@ -138,24 +287,11 @@ curl -s "http://localhost:23119/api/users/0/items?tag=citable&format=json&limit=
 # Get all items in a collection
 curl -s "http://localhost:23119/api/users/0/collections/COLL_KEY/items?format=json" | jq '.[].data | {key, title}'
 
-# Read raw item metadata via REST API
-curl -s "http://localhost:23119/api/users/0/items/KEY?format=json" | jq '.data'
-
 # Find PDF path for an attachment key
 ls ~/Zotero/storage/ATTACHMENT_KEY/*.pdf
 
 # Read fulltext cache directly
-cat ~/Zotero/storage/ATTACHMENT_KEY/.zotero-ft-cache | head -50
-
-# SQLite: Find items by tag (offline)
-sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1" \
-  "SELECT i.key, v.value FROM items i
-   JOIN itemTags it ON i.itemID = it.itemID
-   JOIN tags t ON it.tagID = t.tagID
-   JOIN itemData id ON i.itemID = id.itemID
-   JOIN fields f ON id.fieldID = f.fieldID AND f.fieldName = 'title'
-   JOIN itemDataValues v ON id.valueID = v.valueID
-   WHERE t.name = 'citable' LIMIT 10"
+cat ~/Zotero/storage/ATTACHMENT_KEY/.zotero-ft-cache | head -500
 ```
 
 ## How It Works
