@@ -509,15 +509,62 @@ def resolve_citation_key(citation_key: str, sqlite_path: Path) -> str | None:
         return None
 
 
-def resolve_attachment_key(parent_key: str, sqlite_path: Path) -> str | None:
-    """Finds the primary attachment key for a parent item.
+def _score_attachment(att_key: str, zotero_dir: Path) -> tuple[int, int]:
+    """Scores an attachment by text availability indicators.
+
+    Uses only filesystem stat calls (no text extraction) for speed.
+    Higher scores indicate better expected text quality.
+
+    Args:
+        att_key: The 8-character Zotero key of the attachment.
+        zotero_dir: Path to the Zotero data directory.
+
+    Returns:
+        Tuple of (quality_tier, size) for comparison. quality_tier:
+        2 = has substantial .zotero-ft-cache, 1 = has PDF but no/empty
+        cache, 0 = nothing usable found.
+    """
+    att_dir = zotero_dir / "storage" / att_key
+    if not att_dir.exists():
+        return (0, 0)
+
+    cache = att_dir / ".zotero-ft-cache"
+    if cache.exists():
+        try:
+            cache_size = cache.stat().st_size
+            if cache_size > 100:  # Non-trivial text content
+                return (2, cache_size)
+        except OSError:
+            pass
+
+    pdfs = list(att_dir.glob("*.pdf"))
+    if pdfs:
+        try:
+            return (1, pdfs[0].stat().st_size)
+        except OSError:
+            return (1, 0)
+
+    return (0, 0)
+
+
+def resolve_attachment_key(
+    parent_key: str, sqlite_path: Path, zotero_dir: Path | None = None
+) -> str | None:
+    """Finds the best attachment key for a parent item.
+
+    When multiple attachments exist and zotero_dir is provided, scores each
+    attachment by text availability (cache presence, file size) and returns
+    the one most likely to yield good fulltext. Falls back to the first
+    PDF attachment if scoring is unavailable.
 
     Args:
         parent_key: 8-character Zotero key of the parent item.
         sqlite_path: Absolute path to the zotero.sqlite file.
+        zotero_dir: Path to the Zotero data directory for scoring.
+            If None, returns the first attachment found.
 
     Returns:
-        The attachment's Zotero key, or None if not found.
+        The best attachment's Zotero key, or None if not found.
     """
     if not sqlite_path.exists():
         return None
@@ -528,18 +575,56 @@ def resolve_attachment_key(parent_key: str, sqlite_path: Path) -> str | None:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT att_item.key
+            SELECT att_item.key, att.contentType
             FROM items i
             JOIN itemAttachments att ON i.itemID = att.parentItemID
             JOIN items att_item ON att.itemID = att_item.itemID
             WHERE i.key = ?
-            LIMIT 1
             """,
             (parent_key,),
         )
-        row = cursor.fetchone()
+        rows = cursor.fetchall()
         conn.close()
-        return row[0] if row else None
+
+        if not rows:
+            return None
+
+        # Single attachment — return immediately
+        if len(rows) == 1:
+            return rows[0][0]
+
+        # Multiple attachments — prefer PDFs, then score
+        pdf_keys = [key for key, ctype in rows if ctype == "application/pdf"]
+        candidates = pdf_keys if pdf_keys else [key for key, _ in rows]
+
+        if not zotero_dir or len(candidates) == 1:
+            return candidates[0]
+
+        # Score each candidate by text availability
+        scored = [
+            (_score_attachment(att_key, zotero_dir), att_key)
+            for att_key in candidates
+        ]
+        scored.sort(reverse=True)
+
+        # Log selection diagnostics
+        tier_desc = {2: "ft-cache", 1: "PDF only", 0: "not found"}
+        print(
+            f"Attachment selection: {len(scored)} candidates "
+            f"for {parent_key}",
+            file=sys.stderr,
+        )
+        for score, att_key in scored:
+            tier, size = score
+            label = " [SELECTED]" if att_key == scored[0][1] else ""
+            print(
+                f"  {att_key}: tier={tier} "
+                f"({tier_desc.get(tier, '?')}), "
+                f"size={size}{label}",
+                file=sys.stderr,
+            )
+
+        return scored[0][1]
     except Exception as e:
         print(f"Attachment key lookup failed: {e}", file=sys.stderr)
         return None
@@ -699,28 +784,67 @@ def main() -> None:
     elif args.command == "get-text":
         parent_key = _resolve_key(args.identifier, sqlite_path)
 
-        # Find attachment key
+        # Find attachment key — score candidates when multiple exist
         attachment_key = None
         if api_active and _is_valid_zotero_key(parent_key):
             try:
                 url = (
                     f"http://{ZOTERO_HOST}:{ZOTERO_PORT}"
-                    f"/api/users/0/items/{parent_key}?format=json"
+                    f"/api/users/0/items/{parent_key}/children"
+                    f"?format=json"
                 )
-                with urllib.request.urlopen(url, timeout=3) as response:
-                    item_data = json.loads(response.read().decode("utf-8"))
-                    href = (
-                        item_data.get("links", {})
-                        .get("attachment", {})
-                        .get("href", "")
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    children = json.loads(
+                        response.read().decode("utf-8")
                     )
-                    if href:
-                        attachment_key = href.split("/")[-1]
+                    pdf_keys = [
+                        child.get("key")
+                        for child in children
+                        if child.get("data", {}).get("contentType")
+                        == "application/pdf"
+                    ]
+                    if pdf_keys:
+                        if len(pdf_keys) == 1:
+                            attachment_key = pdf_keys[0]
+                        else:
+                            scored = [
+                                (_score_attachment(k, zotero_dir), k)
+                                for k in pdf_keys
+                            ]
+                            scored.sort(reverse=True)
+                            attachment_key = scored[0][1]
+                            tier_desc = {
+                                2: "ft-cache",
+                                1: "PDF only",
+                                0: "not found",
+                            }
+                            print(
+                                f"Attachment selection (API): "
+                                f"{len(pdf_keys)} PDF candidates",
+                                file=sys.stderr,
+                            )
+                            for score, k in scored:
+                                tier, size = score
+                                label = (
+                                    " [SELECTED]"
+                                    if k == attachment_key
+                                    else ""
+                                )
+                                print(
+                                    f"  {k}: tier={tier} "
+                                    f"({tier_desc.get(tier, '?')}), "
+                                    f"size={size}{label}",
+                                    file=sys.stderr,
+                                )
+                    elif children:
+                        attachment_key = children[0].get("key")
             except Exception:
                 pass
 
         if not attachment_key:
-            attachment_key = resolve_attachment_key(parent_key, sqlite_path)
+            attachment_key = resolve_attachment_key(
+                parent_key, sqlite_path, zotero_dir
+            )
         if not attachment_key:
             attachment_key = parent_key
 
