@@ -253,6 +253,39 @@ curl -s "http://localhost:23119/api/users/0/items?tag=citable&format=json&limit=
   | jq '[.[].data | {key, title, citationKey, date}]'
 ```
 
+### Audit PDF Attachment Quality
+
+When an item has multiple attachments, use this pipeline to compare them
+and identify the best version for agent fulltext access and manual copy-paste.
+Requires `poppler-utils` (`pdfinfo`, `pdffonts`, `pdftotext`).
+
+```bash
+# 1. List all attachment keys and filenames for an item
+uv run scripts/zotero_search.py get-metadata "CITATION_KEY" \
+  | jq '.attachments[] | {key, contentType, filename}'
+
+# 2. For each attachment key, run the one-shot audit:
+ATT_DIR=~/Zotero/storage/ATTACHMENT_KEY
+PDF="$ATT_DIR"/*.pdf
+echo "=== $(basename "$PDF") ===" \
+  && pdfinfo "$PDF" | grep -E 'Creator|Producer|Pages|Encrypted|Page size|File size|Optimized' \
+  && echo "--- Fonts (first 5) ---" \
+  && pdffonts "$PDF" 2>&1 | head -7 \
+  && echo "--- Text extraction ---" \
+  && pdftotext "$PDF" /dev/null && pdftotext "$PDF" - | wc -w | xargs -I{} echo "Words: {}"
+
+# 3. If the best PDF is encrypted (copy:no), decrypt + linearize:
+# qpdf --decrypt INPUT.pdf /tmp/decrypted.pdf
+# qpdf --linearize /tmp/decrypted.pdf ~/OUTPUT_unprotected.pdf
+# Then add the optimized file as new attachment in Zotero (drag & drop).
+```
+
+**Red flags to watch for:**
+-   `Encrypted: yes` with `copy:no` → user cannot copy text; decrypt with `qpdf`
+-   `GlyphLessFont` in fonts → OCR-only text layer (may have errors)
+-   `Producer: Microsoft: Print To PDF` → re-printed scan, often garbled on graphics pages
+-   Word count far below or above sibling attachments → incomplete or inflated with OCR artifacts
+
 ## Error Handling
 
 | Situation | Behavior | Action |

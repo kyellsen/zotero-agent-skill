@@ -247,11 +247,15 @@ def _fetch_item_summary(cursor, key: str, item_id: int) -> dict:
 def get_metadata_api(key: str) -> dict | None:
     """Reads full item metadata via the Zotero Local REST API.
 
+    Fetches the parent item data and then its children to build an
+    attachments list matching the SQLite path output schema.
+
     Args:
         key: The 8-character Zotero item key.
 
     Returns:
-        The item's data dict, or None on failure.
+        The item's data dict including an ``attachments`` list,
+        or None on failure.
     """
     url = (
         f"http://{ZOTERO_HOST}:{ZOTERO_PORT}"
@@ -260,7 +264,35 @@ def get_metadata_api(key: str) -> dict | None:
     try:
         with urllib.request.urlopen(url, timeout=5) as response:
             item = json.loads(response.read().decode("utf-8"))
-            return item.get("data", {})
+            data = item.get("data", {})
+
+        # Fetch children to populate attachments
+        children_url = (
+            f"http://{ZOTERO_HOST}:{ZOTERO_PORT}"
+            f"/api/users/0/items/{key}/children?format=json"
+        )
+        try:
+            with urllib.request.urlopen(children_url, timeout=5) as resp:
+                children = json.loads(resp.read().decode("utf-8"))
+                data["attachments"] = [
+                    {
+                        "key": child.get("key"),
+                        "contentType": child.get("data", {}).get(
+                            "contentType", ""
+                        ),
+                        "path": child.get("data", {}).get("path", ""),
+                        "filename": child.get("data", {}).get(
+                            "filename", ""
+                        ),
+                    }
+                    for child in children
+                    if child.get("data", {}).get("itemType")
+                    == "attachment"
+                ]
+        except Exception:
+            data["attachments"] = []
+
+        return data
     except Exception as e:
         print(f"REST API metadata read failed: {e}", file=sys.stderr)
         return None
