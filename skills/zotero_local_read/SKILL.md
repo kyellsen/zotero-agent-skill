@@ -33,7 +33,16 @@ Read-only search, metadata, and fulltext retrieval from a local Zotero library.
 
 -   🚨 **READ-ONLY**: NEVER write to, modify, or delete any file in the Zotero
     storage directory or database.
--   **SQLite safety**: NEVER open the database without `?mode=ro&immutable=1`.
+-   **SQLite safety**: NEVER open `~/Zotero/zotero.sqlite` read-write, and
+    never with plain `?mode=ro` either — while Zotero runs that fails with
+    "database is locked", and when it does not, SQLite creates `-shm` files
+    in the Zotero directory.
+-   **SQLite freshness**: `?mode=ro&immutable=1` is safe but **blind to every
+    item added or edited since Zotero's last checkpoint** — those writes sit
+    in `zotero.sqlite-wal`, which `immutable=1` ignores, and Zotero may go
+    days without checkpointing. Prefer the REST API while Zotero runs. For
+    SQLite, the CLI handles this; for direct queries follow the snapshot
+    recipe in `references/api-recipes.md`.
 -   **Prefer the CLI** (`scripts/zotero_search.py`) for standard operations.
     For advanced queries not covered by the CLI, use the direct API recipes
     in `references/api-recipes.md`.
@@ -120,7 +129,8 @@ uv run scripts/zotero_search.py get-text "KEY_OR_CITATION_KEY" [--zotero-dir PAT
 
 -   `KEY_OR_CITATION_KEY` (str, required) — Either an 8-char Zotero key
     (`YVHV6XLI`) or a Better BibTeX citation key (`wessolly2014Baumstatik`).
-    Citation keys are automatically resolved via SQLite.
+    Citation keys are resolved via the REST API (exact `citationKey` match),
+    falling back to SQLite.
 -   `--zotero-dir PATH` (Path, optional) — Override Zotero data directory.
 
 **Output:** Plain text on stdout. Can be very large (100k+ chars for books).
@@ -293,6 +303,7 @@ echo "=== $(basename "$PDF") ===" \
 | Zotero not running | Falls back to SQLite + filesystem | No action needed — automatic |
 | `--fulltext` without Zotero | Warning on stderr, falls back to title/creator search | Start Zotero for fulltext search |
 | Citation key not found | Exit code 1, error on stderr | Verify key with `search` first |
+| Item added recently, missing offline | CLI copies `zotero.sqlite` + `-wal` to `/var/tmp` and reads the copy | No action needed — automatic |
 | No attachment found | Exit code 1, diagnostic on stderr | Use `get-metadata` to check attachments |
 | PDF not text-indexed | `get-text` fails, suggests `view_file` | Use agent's `view_file` tool on the PDF directly |
 | SQLite DB not found | Error on stderr, empty results | Check `--zotero-dir` path |
@@ -341,3 +352,16 @@ and falls back to direct SQLite + filesystem access if not:
 | `.zotero-ft-cache` | ❌ No | Instant | Cached plaintext |
 | `pdftotext` | ❌ No | Medium | PDF text layer |
 | HTML parsing | ❌ No | Fast | Web snapshots |
+
+Citation keys and attachment keys are resolved via the REST API first, then
+via SQLite.
+
+**SQLite and the WAL.** Zotero keeps its database in WAL mode under an
+exclusive lock; new and edited items live in `zotero.sqlite-wal` until the
+next checkpoint. The CLI therefore opens the database in one of two ways,
+never touching Zotero's files beyond reading them:
+
+| WAL state | How the CLI opens it | Trade-off |
+|---|---|---|
+| Missing or empty | `zotero.sqlite?mode=ro&immutable=1` in place | Instant, nothing pending to miss |
+| Non-empty | Copies `zotero.sqlite` + `zotero.sqlite-wal` into `/var/tmp/zotero-agent-skill-*`, opens the copy with `mode=ro`, deletes it at exit | One file copy per run (~20 MB); sees every committed write. If Zotero writes during the copy, the CLI retries and may lag a few seconds (warning on stderr) |

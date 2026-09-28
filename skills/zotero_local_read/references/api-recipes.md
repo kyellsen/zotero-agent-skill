@@ -68,6 +68,16 @@ curl -s "http://localhost:23119/api/users/0/items?sort=dateAdded&direction=desc&
 curl -s "http://localhost:23119/api/users/0/items/KEY?format=json" | jq '.data'
 ```
 
+### Resolve Citation Key to Zotero Key
+
+The quick search also matches `citationKey`, but as a substring — filter for
+the exact key:
+
+```bash
+curl -s "http://localhost:23119/api/users/0/items?q=CITATION_KEY&qmode=titleCreatorYear&format=json" \
+  | jq -r '.[] | select(.data.citationKey == "CITATION_KEY") | .key'
+```
+
 ### Export as BibTeX
 
 ```bash
@@ -144,16 +154,42 @@ pdftotext ~/Zotero/storage/ATTACHMENT_KEY/*.pdf - | head -100
 
 ## SQLite Offline Access
 
-Always open with **read-only** and **immutable** flags:
+Prefer the REST API while Zotero runs. SQLite is the fallback, and it has a
+pitfall.
+
+**The WAL pitfall.** Zotero keeps `zotero.sqlite` in WAL mode under an
+exclusive lock. Every item added or edited since Zotero's last checkpoint
+lives only in `zotero.sqlite-wal` — and Zotero may go days without a
+checkpoint. The options for opening the file:
+
+| URI | Result |
+|---|---|
+| `?mode=ro&immutable=1` | Safe, but ignores the WAL: recent items are **silently missing** |
+| `?mode=ro` | "database is locked" while Zotero runs; creates `-shm` files in `~/Zotero` when it does not — never use |
+| Read-write | Never |
+
+So: if `zotero.sqlite-wal` is missing or empty, `immutable=1` on the original
+is complete. Otherwise query a snapshot — copy both files, open the copy:
 
 ```bash
-sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1"
+ZDB="$HOME/Zotero/zotero.sqlite"
+if [ -s "$ZDB-wal" ]; then
+  SNAP=$(mktemp -d /var/tmp/zotero-snapshot-XXXXXX)
+  cp "$ZDB" "$ZDB-wal" "$SNAP/"
+  DB="file:$SNAP/zotero.sqlite?mode=ro"
+else
+  DB="file:$ZDB?mode=ro&immutable=1"
+fi
+sqlite3 "$DB" "SELECT COUNT(*) FROM items"
+# when done: [ -n "$SNAP" ] && rm -rf "$SNAP"
 ```
+
+The recipes below use `$DB` from this block.
 
 ### Search by Title
 
 ```bash
-sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1" \
+sqlite3 "$DB" \
   "SELECT i.key, v.value AS title
    FROM items i
    JOIN itemData id ON i.itemID = id.itemID
@@ -166,7 +202,7 @@ sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1" \
 ### Search by Author
 
 ```bash
-sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1" \
+sqlite3 "$DB" \
   "SELECT DISTINCT i.key, c.lastName, c.firstName
    FROM items i
    JOIN itemCreators ic ON i.itemID = ic.itemID
@@ -178,7 +214,7 @@ sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1" \
 ### Resolve Citation Key to Zotero Key
 
 ```bash
-sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1" \
+sqlite3 "$DB" \
   "SELECT i.key
    FROM items i
    JOIN itemData id ON i.itemID = id.itemID
@@ -190,7 +226,7 @@ sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1" \
 ### Find Items by Tag
 
 ```bash
-sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1" \
+sqlite3 "$DB" \
   "SELECT i.key, v.value AS title
    FROM items i
    JOIN itemTags it ON i.itemID = it.itemID
@@ -205,7 +241,7 @@ sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1" \
 ### Find Attachment Key for a Parent Item
 
 ```bash
-sqlite3 "file:$HOME/Zotero/zotero.sqlite?mode=ro&immutable=1" \
+sqlite3 "$DB" \
   "SELECT att_item.key, att.contentType, att.path
    FROM items i
    JOIN itemAttachments att ON i.itemID = att.parentItemID

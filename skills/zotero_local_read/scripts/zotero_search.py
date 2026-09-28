@@ -18,11 +18,15 @@ Usage:
 """
 
 import argparse
+import atexit
+import functools
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -35,6 +39,10 @@ ZOTERO_HOST = "localhost"
 ITEM_TYPE_ATTACHMENT = 1
 ITEM_TYPE_NOTE = 14
 
+# Disk-backed scratch for WAL snapshots (/tmp is often RAM); None = OS default
+SNAPSHOT_PARENT = Path("/var/tmp") if Path("/var/tmp").is_dir() else None
+SNAPSHOT_ATTEMPTS = 3
+
 
 def _default_zotero_dir() -> Path:
     """Returns the default Zotero data directory.
@@ -43,6 +51,100 @@ def _default_zotero_dir() -> Path:
         Path to ~/Zotero.
     """
     return Path.home() / "Zotero"
+
+
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    """Returns (size, mtime_ns) of a file, or None if it does not exist.
+
+    Args:
+        path: File to stat.
+
+    Returns:
+        The signature tuple, or None if the file is missing.
+    """
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+@functools.cache
+def _sqlite_uri(sqlite_path: Path) -> str:
+    """Returns a read-only SQLite URI that sees every committed transaction.
+
+    Zotero keeps its database in WAL mode with an exclusive lock, so recent
+    writes live in ``zotero.sqlite-wal`` until Zotero checkpoints them —
+    sometimes days later. ``immutable=1`` ignores the WAL (recent items are
+    invisible), and a plain ``mode=ro`` open fails with "database is locked"
+    while Zotero runs and would create ``-shm`` files in the data directory
+    when it does not.
+
+    So: with no pending WAL the original file is opened with
+    ``mode=ro&immutable=1``. With a non-empty WAL, ``zotero.sqlite`` and
+    ``zotero.sqlite-wal`` are copied into a private temp directory and the
+    copy is opened with ``mode=ro``; SQLite then replays the committed WAL
+    frames. Zotero's files are only ever read. The snapshot is taken once per
+    process and removed at exit.
+
+    Args:
+        sqlite_path: Absolute path to the zotero.sqlite file.
+
+    Returns:
+        A ``file:`` URI for ``sqlite3.connect(..., uri=True)``.
+    """
+    immutable_uri = f"file:{sqlite_path}?mode=ro&immutable=1"
+    wal_path = sqlite_path.with_name(sqlite_path.name + "-wal")
+    snapshot: Path | None = None
+    copied = False
+
+    for _attempt in range(SNAPSHOT_ATTEMPTS):
+        before = (_file_signature(sqlite_path), _file_signature(wal_path))
+        if before[1] is None or before[1][0] == 0:
+            return immutable_uri
+
+        if snapshot is None:
+            snapshot_dir = Path(
+                tempfile.mkdtemp(
+                    prefix="zotero-agent-skill-", dir=SNAPSHOT_PARENT
+                )
+            )
+            atexit.register(shutil.rmtree, snapshot_dir, ignore_errors=True)
+            snapshot = snapshot_dir / sqlite_path.name
+        try:
+            shutil.copyfile(sqlite_path, snapshot)
+            shutil.copyfile(wal_path, snapshot.with_name(wal_path.name))
+        except FileNotFoundError:
+            copied = False  # Zotero closed and checkpointed meanwhile
+            continue
+        copied = True
+
+        after = (_file_signature(sqlite_path), _file_signature(wal_path))
+        if after == before:
+            return f"file:{snapshot}?mode=ro"
+
+    if not copied:
+        return immutable_uri
+    # SQLite ignores torn WAL frames (checksums), so a copy taken during a
+    # write still opens; it may just miss the very latest transaction.
+    print(
+        "Warning: Zotero wrote to its database while it was being copied; "
+        "the SQLite snapshot may miss the latest few seconds of changes.",
+        file=sys.stderr,
+    )
+    return f"file:{snapshot}?mode=ro"
+
+
+def _connect_readonly(sqlite_path: Path) -> sqlite3.Connection:
+    """Opens a read-only connection that includes not-yet-checkpointed writes.
+
+    Args:
+        sqlite_path: Absolute path to the zotero.sqlite file.
+
+    Returns:
+        An open SQLite connection (see ``_sqlite_uri`` for the strategy).
+    """
+    return sqlite3.connect(_sqlite_uri(sqlite_path), uri=True)
 
 
 def is_api_running() -> bool:
@@ -124,7 +226,7 @@ def search_sqlite(
 ) -> list[dict]:
     """Queries the local Zotero SQLite database for matching items.
 
-    Uses a read-only, immutable database connection to guarantee safety.
+    Uses a read-only connection (see ``_sqlite_uri``) to guarantee safety.
 
     Args:
         query: Search term matching title, creators, or date.
@@ -139,9 +241,8 @@ def search_sqlite(
         print(f"SQLite DB not found: {sqlite_path}", file=sys.stderr)
         return []
 
-    conn_str = f"file:{sqlite_path}?mode=ro&immutable=1"
     try:
-        conn = sqlite3.connect(conn_str, uri=True)
+        conn = _connect_readonly(sqlite_path)
         cursor = conn.cursor()
 
         sql = """
@@ -311,9 +412,8 @@ def get_metadata_sqlite(key: str, sqlite_path: Path) -> dict | None:
     if not sqlite_path.exists():
         return None
 
-    conn_str = f"file:{sqlite_path}?mode=ro&immutable=1"
     try:
-        conn = sqlite3.connect(conn_str, uri=True)
+        conn = _connect_readonly(sqlite_path)
         cursor = conn.cursor()
 
         cursor.execute(
@@ -504,6 +604,37 @@ def _is_valid_zotero_key(key: str) -> bool:
     return bool(re.match(r"^[A-Z0-9]{8}$", key))
 
 
+def resolve_citation_key_api(citation_key: str) -> str | None:
+    """Resolves a citation key to a Zotero item key via the Local REST API.
+
+    The titleCreatorYear quick search also matches the ``citationKey``
+    field; results are filtered to an exact match because the search is a
+    substring match.
+
+    Args:
+        citation_key: The Better BibTeX citation key.
+
+    Returns:
+        The resolved 8-char Zotero key, or None if not found.
+    """
+    q = urllib.parse.quote(citation_key)
+    url = (
+        f"http://{ZOTERO_HOST}:{ZOTERO_PORT}/api/users/0/items"
+        f"?q={q}&qmode=titleCreatorYear&limit=100&format=json"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            items = json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        print(f"REST API citation key lookup failed: {e}", file=sys.stderr)
+        return None
+
+    for item in items:
+        if item.get("data", {}).get("citationKey") == citation_key:
+            return item.get("key")
+    return None
+
+
 def resolve_citation_key(citation_key: str, sqlite_path: Path) -> str | None:
     """Resolves a Better BibTeX citation key to a Zotero parent item key.
 
@@ -517,9 +648,8 @@ def resolve_citation_key(citation_key: str, sqlite_path: Path) -> str | None:
     if not sqlite_path.exists():
         return None
 
-    conn_str = f"file:{sqlite_path}?mode=ro&immutable=1"
     try:
-        conn = sqlite3.connect(conn_str, uri=True)
+        conn = _connect_readonly(sqlite_path)
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -579,21 +709,105 @@ def _score_attachment(att_key: str, zotero_dir: Path) -> tuple[int, int]:
     return (0, 0)
 
 
+def _select_attachment(
+    rows: list[tuple[str, str | None]],
+    parent_key: str,
+    zotero_dir: Path | None,
+    source: str,
+) -> str | None:
+    """Picks the attachment most likely to yield good fulltext.
+
+    PDFs are preferred over other attachments. When several candidates
+    remain and zotero_dir is provided, each is scored by text availability
+    (cache presence, file size); otherwise the first candidate wins.
+
+    Args:
+        rows: (attachment key, content type) pairs of the parent's
+            attachments.
+        parent_key: 8-character Zotero key of the parent item (for logging).
+        zotero_dir: Path to the Zotero data directory for scoring.
+        source: Label for the diagnostics ("API" or "SQLite").
+
+    Returns:
+        The selected attachment key, or None if rows is empty.
+    """
+    if not rows:
+        return None
+
+    pdf_keys = [key for key, ctype in rows if ctype == "application/pdf"]
+    candidates = pdf_keys if pdf_keys else [key for key, _ in rows]
+
+    if not zotero_dir or len(candidates) == 1:
+        return candidates[0]
+
+    # Score each candidate by text availability
+    scored = [
+        (_score_attachment(att_key, zotero_dir), att_key)
+        for att_key in candidates
+    ]
+    scored.sort(reverse=True)
+
+    # Log selection diagnostics
+    tier_desc = {2: "ft-cache", 1: "PDF only", 0: "not found"}
+    print(
+        f"Attachment selection ({source}): {len(scored)} candidates "
+        f"for {parent_key}",
+        file=sys.stderr,
+    )
+    for score, att_key in scored:
+        tier, size = score
+        label = " [SELECTED]" if att_key == scored[0][1] else ""
+        print(
+            f"  {att_key}: tier={tier} "
+            f"({tier_desc.get(tier, '?')}), "
+            f"size={size}{label}",
+            file=sys.stderr,
+        )
+
+    return scored[0][1]
+
+
+def resolve_attachment_key_api(
+    parent_key: str, zotero_dir: Path | None = None
+) -> str | None:
+    """Finds the best attachment key for a parent item via the REST API.
+
+    Args:
+        parent_key: 8-character Zotero key of the parent item.
+        zotero_dir: Path to the Zotero data directory for scoring.
+
+    Returns:
+        The best attachment's Zotero key, or None if not found.
+    """
+    url = (
+        f"http://{ZOTERO_HOST}:{ZOTERO_PORT}"
+        f"/api/users/0/items/{parent_key}/children?format=json"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            children = json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        print(f"REST API attachment lookup failed: {e}", file=sys.stderr)
+        return None
+
+    rows = [
+        (child.get("key"), child.get("data", {}).get("contentType"))
+        for child in children
+        if child.get("data", {}).get("itemType") == "attachment"
+    ]
+    return _select_attachment(rows, parent_key, zotero_dir, "API")
+
+
 def resolve_attachment_key(
     parent_key: str, sqlite_path: Path, zotero_dir: Path | None = None
 ) -> str | None:
-    """Finds the best attachment key for a parent item.
-
-    When multiple attachments exist and zotero_dir is provided, scores each
-    attachment by text availability (cache presence, file size) and returns
-    the one most likely to yield good fulltext. Falls back to the first
-    PDF attachment if scoring is unavailable.
+    """Finds the best attachment key for a parent item via SQLite.
 
     Args:
         parent_key: 8-character Zotero key of the parent item.
         sqlite_path: Absolute path to the zotero.sqlite file.
         zotero_dir: Path to the Zotero data directory for scoring.
-            If None, returns the first attachment found.
+            If None, returns the first candidate found.
 
     Returns:
         The best attachment's Zotero key, or None if not found.
@@ -601,9 +815,8 @@ def resolve_attachment_key(
     if not sqlite_path.exists():
         return None
 
-    conn_str = f"file:{sqlite_path}?mode=ro&immutable=1"
     try:
-        conn = sqlite3.connect(conn_str, uri=True)
+        conn = _connect_readonly(sqlite_path)
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -617,57 +830,23 @@ def resolve_attachment_key(
         )
         rows = cursor.fetchall()
         conn.close()
-
-        if not rows:
-            return None
-
-        # Single attachment — return immediately
-        if len(rows) == 1:
-            return rows[0][0]
-
-        # Multiple attachments — prefer PDFs, then score
-        pdf_keys = [key for key, ctype in rows if ctype == "application/pdf"]
-        candidates = pdf_keys if pdf_keys else [key for key, _ in rows]
-
-        if not zotero_dir or len(candidates) == 1:
-            return candidates[0]
-
-        # Score each candidate by text availability
-        scored = [
-            (_score_attachment(att_key, zotero_dir), att_key)
-            for att_key in candidates
-        ]
-        scored.sort(reverse=True)
-
-        # Log selection diagnostics
-        tier_desc = {2: "ft-cache", 1: "PDF only", 0: "not found"}
-        print(
-            f"Attachment selection: {len(scored)} candidates "
-            f"for {parent_key}",
-            file=sys.stderr,
-        )
-        for score, att_key in scored:
-            tier, size = score
-            label = " [SELECTED]" if att_key == scored[0][1] else ""
-            print(
-                f"  {att_key}: tier={tier} "
-                f"({tier_desc.get(tier, '?')}), "
-                f"size={size}{label}",
-                file=sys.stderr,
-            )
-
-        return scored[0][1]
     except Exception as e:
         print(f"Attachment key lookup failed: {e}", file=sys.stderr)
         return None
 
+    return _select_attachment(rows, parent_key, zotero_dir, "SQLite")
 
-def _resolve_key(identifier: str, sqlite_path: Path) -> str:
+
+def _resolve_key(identifier: str, sqlite_path: Path, api_active: bool) -> str:
     """Resolves any identifier (Zotero key or citation key) to a Zotero key.
+
+    Tries the REST API first when it is running (it sees every item at
+    once), then SQLite.
 
     Args:
         identifier: A Zotero key or citation key.
         sqlite_path: Path to the zotero.sqlite file.
+        api_active: Whether the Zotero Local REST API is reachable.
 
     Returns:
         The resolved Zotero key.
@@ -678,7 +857,11 @@ def _resolve_key(identifier: str, sqlite_path: Path) -> str:
     if _is_valid_zotero_key(identifier):
         return identifier
 
-    resolved = resolve_citation_key(identifier, sqlite_path)
+    resolved = None
+    if api_active:
+        resolved = resolve_citation_key_api(identifier)
+    if not resolved:
+        resolved = resolve_citation_key(identifier, sqlite_path)
     if resolved:
         return resolved
 
@@ -707,9 +890,8 @@ def get_status(zotero_dir: Path, sqlite_path: Path) -> dict:
     attachment_count = 0
 
     if sqlite_exists:
-        conn_str = f"file:{sqlite_path}?mode=ro&immutable=1"
         try:
-            conn = sqlite3.connect(conn_str, uri=True)
+            conn = _connect_readonly(sqlite_path)
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT COUNT(*) FROM items WHERE itemTypeID NOT IN (?, ?)",
@@ -814,65 +996,12 @@ def main() -> None:
         print(json.dumps(results, indent=2, ensure_ascii=False))
 
     elif args.command == "get-text":
-        parent_key = _resolve_key(args.identifier, sqlite_path)
+        parent_key = _resolve_key(args.identifier, sqlite_path, api_active)
 
         # Find attachment key — score candidates when multiple exist
         attachment_key = None
-        if api_active and _is_valid_zotero_key(parent_key):
-            try:
-                url = (
-                    f"http://{ZOTERO_HOST}:{ZOTERO_PORT}"
-                    f"/api/users/0/items/{parent_key}/children"
-                    f"?format=json"
-                )
-                with urllib.request.urlopen(url, timeout=5) as response:
-                    children = json.loads(
-                        response.read().decode("utf-8")
-                    )
-                    pdf_keys = [
-                        child.get("key")
-                        for child in children
-                        if child.get("data", {}).get("contentType")
-                        == "application/pdf"
-                    ]
-                    if pdf_keys:
-                        if len(pdf_keys) == 1:
-                            attachment_key = pdf_keys[0]
-                        else:
-                            scored = [
-                                (_score_attachment(k, zotero_dir), k)
-                                for k in pdf_keys
-                            ]
-                            scored.sort(reverse=True)
-                            attachment_key = scored[0][1]
-                            tier_desc = {
-                                2: "ft-cache",
-                                1: "PDF only",
-                                0: "not found",
-                            }
-                            print(
-                                f"Attachment selection (API): "
-                                f"{len(pdf_keys)} PDF candidates",
-                                file=sys.stderr,
-                            )
-                            for score, k in scored:
-                                tier, size = score
-                                label = (
-                                    " [SELECTED]"
-                                    if k == attachment_key
-                                    else ""
-                                )
-                                print(
-                                    f"  {k}: tier={tier} "
-                                    f"({tier_desc.get(tier, '?')}), "
-                                    f"size={size}{label}",
-                                    file=sys.stderr,
-                                )
-                    elif children:
-                        attachment_key = children[0].get("key")
-            except Exception:
-                pass
-
+        if api_active:
+            attachment_key = resolve_attachment_key_api(parent_key, zotero_dir)
         if not attachment_key:
             attachment_key = resolve_attachment_key(
                 parent_key, sqlite_path, zotero_dir
@@ -898,7 +1027,7 @@ def main() -> None:
             sys.exit(1)
 
     elif args.command == "get-metadata":
-        parent_key = _resolve_key(args.identifier, sqlite_path)
+        parent_key = _resolve_key(args.identifier, sqlite_path, api_active)
 
         metadata = None
         if api_active:

@@ -90,6 +90,12 @@ uv run skills/zotero_local_read/scripts/zotero_search.py get-metadata "YVHV6XLI"
 uv run skills/zotero_local_write/scripts/zotero_update.py read "YVHV6XLI"
 ```
 
+## Tests
+
+```bash
+uv run --no-project --with pytest pytest tests -m unit
+```
+
 ## License
 
 MIT
